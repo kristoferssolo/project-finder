@@ -1,0 +1,334 @@
+use crate::{
+    commands::{find_files, find_git_repos, grep_file},
+    config::Config,
+    dependencies::Dependencies,
+    errors::{ProjectFinderError, Result},
+};
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use tokio::sync::Mutex;
+use tracing::{debug, info};
+
+type ProjectSet = Arc<Mutex<HashSet<PathBuf>>>;
+type WorkspaceCache = Arc<Mutex<HashMap<PathBuf, bool>>>;
+type RootCache = Arc<Mutex<HashMap<(PathBuf, String), PathBuf>>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkerType {
+    PackageJson,
+    CargoToml,
+    DenoJson,
+    BuildFile(String),
+    OtherConfig(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectFinder {
+    config: Config,
+    deps: Dependencies,
+    discovered_projects: ProjectSet,
+    workspace_cache: WorkspaceCache,
+    root_cache: RootCache,
+}
+
+impl ProjectFinder {
+    pub fn new(config: Config, deps: Dependencies) -> Self {
+        Self {
+            config,
+            deps,
+            discovered_projects: Arc::new(Mutex::new(HashSet::new())),
+            workspace_cache: Arc::new(Mutex::new(HashMap::new())),
+            root_cache: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub async fn find_projects(&self) -> Result<Vec<PathBuf>> {
+        // Process each search directory
+        let mut handles = vec![];
+
+        for path in &self.config.paths {
+            let path_buf = PathBuf::from(path);
+            if !path_buf.is_dir() {
+                return Err(ProjectFinderError::PathNotFound(path_buf));
+            }
+
+            if self.config.verbose {
+                info!("Searching in: {}", path);
+            }
+
+            let finder_clone = self.clone();
+            let path_clone = path_buf.clone();
+
+            // Spawn a task for each directory
+            let handle =
+                tokio::spawn(async move { finder_clone.process_directory(&path_clone).await });
+
+            handles.push(handle);
+        }
+
+        // Wait for all tasks to complete
+        for handle in handles {
+            match handle.await {
+                Ok(result) => {
+                    // Propagate internal errors
+                    if let Err(e) = result {
+                        debug!("Task failed: {}", e);
+                    }
+                }
+                Err(e) => {
+                    debug!("Task join error: {}", e);
+                }
+            }
+        }
+
+        // Return sorted results
+        let mut projects: Vec<PathBuf> = {
+            let projects_guard = self.discovered_projects.lock().await;
+            projects_guard.iter().cloned().collect()
+        };
+
+        projects.sort();
+        Ok(projects)
+    }
+
+    async fn process_directory(&self, dir: &Path) -> Result<()> {
+        // First find all git repositories (usually the most reliable project indicators)
+        let git_repos = find_git_repos(&self.deps, dir, self.config.depth).await?;
+
+        {
+            let mut projects = self.discovered_projects.lock().await;
+            projects.extend(git_repos);
+        }
+
+        // Find relevant marker files
+        let marker_patterns = [
+            "package.json",
+            "pnpm-workspace.yaml",
+            "lerna.json",
+            "Cargo.toml",
+            "go.mod",
+            "pyproject.toml",
+            "CMakeLists.txt",
+            "Makefile",
+            "justfile",
+            "Justfile",
+            "deno.json",
+            "deno.jsonc",
+            "bunfig.toml",
+        ];
+
+        for pattern in &marker_patterns {
+            let paths = find_files(&self.deps, dir, pattern, self.config.depth).await?;
+
+            for path in paths {
+                if let Some(parent_dir) = path.parent() {
+                    self.process_marker(parent_dir, pattern).await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn process_marker(&self, dir: &Path, marker_name: &str) -> Result<()> {
+        // Determine marker type
+        let marker_type = match marker_name {
+            "package.json" => MarkerType::PackageJson,
+            "Cargo.toml" => MarkerType::CargoToml,
+            "deno.json" | "deno.jsonc" => MarkerType::DenoJson,
+            "Makefile" | "CMakeLists.txt" | "justfile" | "Justfile" => {
+                MarkerType::BuildFile(marker_name.to_string())
+            }
+            _ => MarkerType::OtherConfig(marker_name.to_string()),
+        };
+
+        // Find project root
+        let project_root = self.find_project_root(dir, &marker_type).await?;
+
+        // Check if it's a subdirectory of an already discovered project
+        let mut should_add = true;
+        {
+            let projects = self.discovered_projects.lock().await;
+            for known_project in projects.iter() {
+                if project_root.starts_with(known_project) && project_root != *known_project {
+                    should_add = false;
+                    break;
+                }
+            }
+        }
+
+        if should_add {
+            let mut projects = self.discovered_projects.lock().await;
+            projects.insert(project_root);
+        }
+
+        Ok(())
+    }
+
+    async fn find_project_root(&self, dir: &Path, marker_type: &MarkerType) -> Result<PathBuf> {
+        // Check cache
+        let cache_key = (dir.to_path_buf(), format!("{marker_type:?}"));
+        {
+            let cache = self.root_cache.lock().await;
+            if let Some(root) = cache.get(&cache_key) {
+                return Ok(root.clone());
+            }
+        }
+
+        let mut result = dir.to_path_buf();
+
+        match marker_type {
+            MarkerType::PackageJson | MarkerType::DenoJson => {
+                // Check for workspace roots
+                let mut current = dir.to_path_buf();
+                while let Some(parent) = current.parent() {
+                    if parent.as_os_str().is_empty() {
+                        break;
+                    }
+
+                    if self.is_workspace_root(parent).await? {
+                        result = parent.to_path_buf();
+                        break;
+                    }
+
+                    if parent.join(".git").is_dir() {
+                        result = parent.to_path_buf();
+                        break;
+                    }
+
+                    current = parent.to_path_buf();
+                }
+            }
+
+            MarkerType::CargoToml => {
+                // Check for Cargo workspace
+                let mut current = dir.to_path_buf();
+                while let Some(parent) = current.parent() {
+                    if parent.as_os_str().is_empty() {
+                        break;
+                    }
+
+                    let cargo_toml = parent.join("Cargo.toml");
+                    if cargo_toml.exists()
+                        && grep_file(&self.deps, &cargo_toml, r"^\[workspace\]").await?
+                    {
+                        result = parent.to_path_buf();
+                        break;
+                    }
+
+                    if parent.join(".git").is_dir() {
+                        result = parent.to_path_buf();
+                        break;
+                    }
+
+                    current = parent.to_path_buf();
+                }
+            }
+
+            MarkerType::BuildFile(name) => {
+                // For build system files, find the highest one that's still in the same git repo
+                let mut highest_dir = dir.to_path_buf();
+                let mut current = dir.to_path_buf();
+
+                while let Some(parent) = current.parent() {
+                    if parent.as_os_str().is_empty() {
+                        break;
+                    }
+
+                    if parent.join(name).exists() {
+                        highest_dir = parent.to_path_buf();
+                    }
+
+                    if parent.join(".git").is_dir() {
+                        result = parent.to_path_buf();
+                        break;
+                    }
+
+                    current = parent.to_path_buf();
+                }
+
+                if result == dir.to_path_buf() {
+                    result = highest_dir;
+                }
+            }
+
+            MarkerType::OtherConfig(_) => {
+                // For other file types, just look for git repos
+                let mut current = dir.to_path_buf();
+                while let Some(parent) = current.parent() {
+                    if parent.as_os_str().is_empty() {
+                        break;
+                    }
+
+                    if parent.join(".git").is_dir() {
+                        result = parent.to_path_buf();
+                        break;
+                    }
+
+                    current = parent.to_path_buf();
+                }
+            }
+        }
+
+        // Cache the result
+        self.root_cache
+            .lock()
+            .await
+            .insert(cache_key, result.clone());
+
+        Ok(result)
+    }
+
+    async fn is_workspace_root(&self, dir: &Path) -> Result<bool> {
+        // Check cache
+        {
+            let cache = self.workspace_cache.lock().await;
+            if let Some(&result) = cache.get(dir) {
+                return Ok(result);
+            }
+        }
+
+        // Define workspace patterns to check
+        let workspace_patterns = [
+            (dir.join("package.json"), r#""workspaces""#),
+            (dir.join("deno.json"), r#""workspaces""#),
+            (dir.join("deno.jsonc"), r#""workspaces""#),
+            (dir.join("bunfig.toml"), r"workspaces"),
+        ];
+
+        // Files that indicate workspaces just by existing
+        let workspace_files = [dir.join("pnpm-workspace.yaml"), dir.join("lerna.json")];
+
+        // Check for workspace by pattern matching
+        for (file, pattern) in &workspace_patterns {
+            if file.exists() && grep_file(&self.deps, file, pattern).await? {
+                self.workspace_cache
+                    .lock()
+                    .await
+                    .insert(dir.to_path_buf(), true);
+                return Ok(true);
+            }
+        }
+
+        // Check for workspace by file existence
+        for file in &workspace_files {
+            if file.exists() {
+                self.workspace_cache
+                    .lock()
+                    .await
+                    .insert(dir.to_path_buf(), true);
+                return Ok(true);
+            }
+        }
+
+        // No workspace found
+        self.workspace_cache
+            .lock()
+            .await
+            .insert(dir.to_path_buf(), false);
+        Ok(false)
+    }
+}

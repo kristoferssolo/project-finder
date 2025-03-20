@@ -1,6 +1,31 @@
 [package]
 name = "project-finder"
+authors = ["Kristofers Solo <dev@kristofers.xyz>"]
 version = "0.1.0"
 edition = "2024"
+description = "Fast project finder for developers"
+repository = "https://github.com/kristoferssolo/project-finder"
+documentation = "https://docs.rs/project-finder"
+homepage = "https://github.com/kristoferssolo/project-finder"
+license = "MIT OR Apache-2.0"
+keywords = ["cli", "string", "text", "utility"]
+categories = ["command-line-utilities"]
+exclude = ["/.github", "/.gitignore", "/tests", "*.png", "*.md"]
+readme = "README.md"
 
 [dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+thiserror = "2.0"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+which = "7.0"
+
+[dev-dependencies]
+
+[lints.clippy]
+pedantic = "warn"
+nursery = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
