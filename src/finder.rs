@@ -4,6 +4,7 @@ use crate::{
     dependencies::Dependencies,
     errors::{ProjectFinderError, Result},
 };
+use futures::future::join_all;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -46,7 +47,7 @@ impl ProjectFinder {
     }
 
     pub async fn find_projects(&self) -> Result<Vec<PathBuf>> {
-        // Process each search directory
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(8)); // Limit to 8 concurrent tasks
         let mut handles = vec![];
 
         for path in &self.config.paths {
@@ -61,27 +62,43 @@ impl ProjectFinder {
 
             let finder_clone = self.clone();
             let path_clone = path_buf.clone();
+            let semaphore_clone = Arc::clone(&semaphore);
 
-            // Spawn a task for each directory
-            let handle =
-                tokio::spawn(async move { finder_clone.process_directory(&path_clone).await });
+            // Spawn a task for each directory with semaphore permit
+            let handle = tokio::spawn(async move {
+                let _permit = semaphore_clone.acquire().await.map_err(|e| {
+                    ProjectFinderError::CommandExecutionFailed(format!(
+                        "Failed to aquire semaphore: {e}"
+                    ))
+                })?;
+                finder_clone.process_directory(&path_clone).await
+            });
 
             handles.push(handle);
         }
 
-        // Wait for all tasks to complete
-        for handle in handles {
-            match handle.await {
-                Ok(result) => {
-                    // Propagate internal errors
-                    if let Err(e) = result {
-                        debug!("Task failed: {}", e);
-                    }
-                }
+        let handle_results = join_all(handles).await;
+
+        let mut errors = handle_results
+            .into_iter()
+            .filter_map(|handle_result| match handle_result {
+                Ok(task_result) => task_result.err().map(|e| {
+                    debug!("Task failed: {}", e);
+                    e
+                }),
                 Err(e) => {
                     debug!("Task join error: {}", e);
+                    Some(ProjectFinderError::CommandExecutionFailed(format!(
+                        "Task panicked: {e}",
+                    )))
                 }
-            }
+            })
+            .collect::<Vec<_>>();
+
+        // Return first error if any occurred
+        if !errors.is_empty() && errors.len() == self.config.paths.len() {
+            // Only fail if all tasks failed
+            return Err(errors.remove(0));
         }
 
         // Return sorted results
@@ -91,6 +108,12 @@ impl ProjectFinder {
         };
 
         projects.sort();
+
+        // Apply max_results if set
+        if self.config.max_results > 0 && projects.len() > self.config.max_results {
+            projects.truncate(self.config.max_results);
+        }
+
         Ok(projects)
     }
 
@@ -148,12 +171,23 @@ impl ProjectFinder {
         // Find project root
         let project_root = self.find_project_root(dir, &marker_type).await?;
 
-        // Check if it's a subdirectory of an already discovered project
+        // Improved nested project detection
+        // Only ignore if it's a subproject of the same type (prevents ignoring
+        // valid nested projects of different types)
         let mut should_add = true;
         {
             let projects = self.discovered_projects.lock().await;
             for known_project in projects.iter() {
-                if project_root.starts_with(known_project) && project_root != *known_project {
+                // Check if this is a direct parent (not just any ancestor)
+                let is_direct_parent = project_root
+                    .parent()
+                    .is_some_and(|parent| parent == known_project);
+
+                // Only exclude if it's a subdirectory and has the same marker type
+                // or if it's exactly the same directory
+                if project_root == *known_project
+                    || project_root.starts_with(known_project) && !is_direct_parent
+                {
                     should_add = false;
                     break;
                 }
@@ -293,14 +327,24 @@ impl ProjectFinder {
 
         // Define workspace patterns to check
         let workspace_patterns = [
-            (dir.join("package.json"), r#""workspaces""#),
-            (dir.join("deno.json"), r#""workspaces""#),
-            (dir.join("deno.jsonc"), r#""workspaces""#),
+            (dir.join("package.json"), r#"("workspaces"|"workspace")"#),
+            (dir.join("deno.json"), r#"("workspaces"|"imports")"#),
+            (dir.join("deno.jsonc"), r#"("workspaces"|"imports")"#),
             (dir.join("bunfig.toml"), r"workspaces"),
+            (dir.join("Cargo.toml"), r"^\[workspace\]"),
+            (dir.join("rush.json"), r"."),
+            (dir.join("nx.json"), r"."),
+            (dir.join("turbo.json"), r"."),
         ];
 
         // Files that indicate workspaces just by existing
-        let workspace_files = [dir.join("pnpm-workspace.yaml"), dir.join("lerna.json")];
+        let workspace_files = [
+            dir.join("pnpm-workspace.yaml"),
+            dir.join("lerna.json"),
+            dir.join("yarn.lock"),      // Common in yarn workspaces
+            dir.join(".yarnrc.yml"),    // Yarn 2+ workspaces
+            dir.join("workspace.json"), // Generic workspace file
+        ];
 
         // Check for workspace by pattern matching
         for (file, pattern) in &workspace_patterns {

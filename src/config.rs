@@ -18,4 +18,8 @@ pub struct Config {
     /// Show verbose output
     #[clap(short, long)]
     pub verbose: bool,
+
+    /// Maximum number of results to return
+    #[clap(short = 'n', long, default_value = "0")]
+    pub max_results: usize,
 }

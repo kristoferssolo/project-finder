@@ -93,6 +93,7 @@ pub async fn grep_file(deps: &Dependencies, file: &Path, pattern: &str) -> Resul
     let mut cmd = Command::new(&deps.rg_path);
 
     cmd.arg("-q") // quiet mode, just return exit code
+        .arg("-e") // explicitly specify pattern
         .arg(pattern)
         .arg(file);
 

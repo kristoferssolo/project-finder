@@ -31,7 +31,7 @@ impl Dependencies {
             )
         })?;
         info!("Found fd at: {}", fd_path.display());
-        info!("Found rupgrep at: {}", rg_path.display());
+        info!("Found ripgrep at: {}", rg_path.display());
 
         Ok(Self::new(
             fd_path.to_string_lossy(),
