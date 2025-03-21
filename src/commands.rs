@@ -1,20 +1,36 @@
-use crate::errors::{ProjectFinderError, Result};
+use crate::{
+    dependencies::Dependencies,
+    errors::{ProjectFinderError, Result},
+};
+use regex::{Regex, escape};
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     process::Stdio,
 };
-use tokio::process::Command;
+use tokio::{
+    fs::read_to_string,
+    io::{AsyncBufReadExt, BufReader},
+    process::Command,
+};
 use tracing::{debug, warn};
-
-use crate::dependencies::Dependencies;
 
 /// Run fd command to find files and directories
 pub async fn find_files(
     deps: &Dependencies,
     dir: &Path,
-    pattern: &str,
+    patterns: &[&str],
     max_depth: usize,
-) -> Result<Vec<PathBuf>> {
+) -> Result<HashMap<String, Vec<PathBuf>>> {
+    let combined_patterns = format!(
+        "({})",
+        patterns
+            .iter()
+            .map(|pattern| escape(pattern))
+            .collect::<Vec<_>>()
+            .join("|")
+    );
+
     let mut cmd = Command::new(&deps.fd_path);
 
     cmd.arg("--hidden")
@@ -23,26 +39,49 @@ pub async fn find_files(
         .arg("f")
         .arg("--max-depth")
         .arg(max_depth.to_string())
-        .arg(pattern)
+        .arg(&combined_patterns)
         .arg(dir)
         .stdout(Stdio::piped());
 
-    debug!("Running: fd {} in {}", pattern, dir.display());
+    debug!("Running: fd with combined pattern in {}", dir.display());
 
-    let output = cmd.output().await.map_err(|e| {
-        ProjectFinderError::CommandExecutionFailed(format!("Failed to execute fd: {e}"))
+    let mut child = cmd.spawn().map_err(|e| {
+        ProjectFinderError::CommandExecutionFailed(format!("Failed to spawn fd: {e}"))
     })?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!("fd command failed: {stderr}");
-        return Ok(Vec::new());
+    // Take the stdout and wrap it with a buffered reader.
+    let stdout = child.stdout.take().ok_or_else(|| {
+        ProjectFinderError::CommandExecutionFailed("Failed to capture stdout".into())
+    })?;
+    let reader = BufReader::new(stdout);
+    let mut lines = reader.lines();
+
+    let mut results = patterns
+        .iter()
+        .map(|pattern| ((*pattern).to_string(), Vec::new()))
+        .collect::<HashMap<_, _>>();
+
+    // Process output as lines arrive.
+    while let Some(line) = lines.next_line().await.map_err(|e| {
+        ProjectFinderError::CommandExecutionFailed(format!("Failed to read stdout: {e}"))
+    })? {
+        let path = PathBuf::from(line);
+        if let Some(file_name) = path.file_name().and_then(|f| f.to_str()) {
+            if let Some(entries) = results.get_mut(file_name) {
+                entries.push(path);
+            }
+        }
     }
 
-    let stdout = String::from_utf8(output.stdout).map_err(ProjectFinderError::Utf8Error)?;
+    // Ensure the process has finished.
+    let status = child.wait().await.map_err(|e| {
+        ProjectFinderError::CommandExecutionFailed(format!("Failed to wait process: {e}"))
+    })?;
+    if !status.success() {
+        warn!("fd command exited with non-zero status: {status}");
+    }
 
-    let paths = stdout.lines().map(PathBuf::from).collect();
-    Ok(paths)
+    Ok(results)
 }
 
 /// Find Git repositories
@@ -88,18 +127,17 @@ pub async fn find_git_repos(
     Ok(paths)
 }
 
-/// Run grep on a file to check for a pattern
-pub async fn grep_file(deps: &Dependencies, file: &Path, pattern: &str) -> Result<bool> {
-    let mut cmd = Command::new(&deps.rg_path);
-
-    cmd.arg("-q") // quiet mode, just return exit code
-        .arg("-e") // explicitly specify pattern
-        .arg(pattern)
-        .arg(file);
-
-    let status = cmd.status().await.map_err(|e| {
-        ProjectFinderError::CommandExecutionFailed(format!("Failed to execute ripgrep: {e}"))
+pub async fn grep_file_in_memory(file: &Path, pattern: &str) -> Result<bool> {
+    let contents = read_to_string(file).await.map_err(|e| {
+        ProjectFinderError::CommandExecutionFailed(format!(
+            "Failed to read file {}: {e}",
+            file.display()
+        ))
     })?;
 
-    Ok(status.success())
+    let re = Regex::new(pattern).map_err(|e| {
+        ProjectFinderError::CommandExecutionFailed(format!("Invalid regex patter {pattern}: {e}"))
+    })?;
+
+    Ok(re.is_match(&contents))
 }

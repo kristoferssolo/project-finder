@@ -3,11 +3,10 @@ mod config;
 mod dependencies;
 mod errors;
 mod finder;
+mod marker;
 
+use crate::{config::Config, dependencies::Dependencies, finder::ProjectFinder};
 use clap::Parser;
-use config::Config;
-use dependencies::Dependencies;
-use finder::ProjectFinder;
 use std::process::exit;
 use tracing::{Level, error};
 use tracing_subscriber::FmtSubscriber;

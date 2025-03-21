@@ -1,8 +1,9 @@
 use crate::{
-    commands::{find_files, find_git_repos, grep_file},
+    commands::{find_files, find_git_repos, grep_file_in_memory},
     config::Config,
     dependencies::Dependencies,
     errors::{ProjectFinderError, Result},
+    marker::MarkerType,
 };
 use futures::future::join_all;
 use std::{
@@ -10,20 +11,35 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tokio::sync::Mutex;
+use tokio::{
+    fs::metadata,
+    spawn,
+    sync::{RwLock, Semaphore},
+};
 use tracing::{debug, info};
 
-type ProjectSet = Arc<Mutex<HashSet<PathBuf>>>;
-type WorkspaceCache = Arc<Mutex<HashMap<PathBuf, bool>>>;
-type RootCache = Arc<Mutex<HashMap<(PathBuf, String), PathBuf>>>;
+type ProjectSet = Arc<RwLock<HashSet<PathBuf>>>;
+type WorkspaceCache = Arc<RwLock<HashMap<PathBuf, bool>>>;
+type RootCache = Arc<RwLock<HashMap<(PathBuf, String), PathBuf>>>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MarkerType {
-    PackageJson,
-    CargoToml,
-    DenoJson,
-    BuildFile(String),
-    OtherConfig(String),
+const MARKER_PATTERNS: [&str; 13] = [
+    "package.json",
+    "pnpm-workspace.yaml",
+    "lerna.json",
+    "Cargo.toml",
+    "go.mod",
+    "pyproject.toml",
+    "CMakeLists.txt",
+    "Makefile",
+    "justfile",
+    "Justfile",
+    "deno.json",
+    "deno.jsonc",
+    "bunfig.toml",
+];
+
+async fn path_exists(path: &Path) -> bool {
+    metadata(path).await.is_ok()
 }
 
 #[derive(Debug, Clone)]
@@ -40,14 +56,14 @@ impl ProjectFinder {
         Self {
             config,
             deps,
-            discovered_projects: Arc::new(Mutex::new(HashSet::new())),
-            workspace_cache: Arc::new(Mutex::new(HashMap::new())),
-            root_cache: Arc::new(Mutex::new(HashMap::new())),
+            discovered_projects: Arc::new(RwLock::new(HashSet::new())),
+            workspace_cache: Arc::new(RwLock::new(HashMap::new())),
+            root_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     pub async fn find_projects(&self) -> Result<Vec<PathBuf>> {
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(8)); // Limit to 8 concurrent tasks
+        let semaphore = Arc::new(Semaphore::new(8)); // Limit to 8 concurrent tasks
         let mut handles = vec![];
 
         for path in &self.config.paths {
@@ -65,7 +81,7 @@ impl ProjectFinder {
             let semaphore_clone = Arc::clone(&semaphore);
 
             // Spawn a task for each directory with semaphore permit
-            let handle = tokio::spawn(async move {
+            let handle = spawn(async move {
                 let _permit = semaphore_clone.acquire().await.map_err(|e| {
                     ProjectFinderError::CommandExecutionFailed(format!(
                         "Failed to aquire semaphore: {e}"
@@ -73,21 +89,19 @@ impl ProjectFinder {
                 })?;
                 finder_clone.process_directory(&path_clone).await
             });
-
             handles.push(handle);
         }
 
         let handle_results = join_all(handles).await;
-
         let mut errors = handle_results
             .into_iter()
             .filter_map(|handle_result| match handle_result {
                 Ok(task_result) => task_result.err().map(|e| {
-                    debug!("Task failed: {}", e);
+                    debug!("Task failed: {e}");
                     e
                 }),
                 Err(e) => {
-                    debug!("Task join error: {}", e);
+                    debug!("Task join error: {e}");
                     Some(ProjectFinderError::CommandExecutionFailed(format!(
                         "Task panicked: {e}",
                     )))
@@ -96,16 +110,19 @@ impl ProjectFinder {
             .collect::<Vec<_>>();
 
         // Return first error if any occurred
+        // Only fail if all tasks failed
         if !errors.is_empty() && errors.len() == self.config.paths.len() {
-            // Only fail if all tasks failed
             return Err(errors.remove(0));
         }
 
         // Return sorted results
-        let mut projects: Vec<PathBuf> = {
-            let projects_guard = self.discovered_projects.lock().await;
-            projects_guard.iter().cloned().collect()
-        };
+        let mut projects = self
+            .discovered_projects
+            .read()
+            .await
+            .iter()
+            .cloned()
+            .collect::<Vec<PathBuf>>();
 
         projects.sort();
 
@@ -122,33 +139,15 @@ impl ProjectFinder {
         let git_repos = find_git_repos(&self.deps, dir, self.config.depth).await?;
 
         {
-            let mut projects = self.discovered_projects.lock().await;
-            projects.extend(git_repos);
+            self.discovered_projects.write().await.extend(git_repos);
         }
 
-        // Find relevant marker files
-        let marker_patterns = [
-            "package.json",
-            "pnpm-workspace.yaml",
-            "lerna.json",
-            "Cargo.toml",
-            "go.mod",
-            "pyproject.toml",
-            "CMakeLists.txt",
-            "Makefile",
-            "justfile",
-            "Justfile",
-            "deno.json",
-            "deno.jsonc",
-            "bunfig.toml",
-        ];
+        let marker_map = find_files(&self.deps, dir, &MARKER_PATTERNS, self.config.depth).await?;
 
-        for pattern in &marker_patterns {
-            let paths = find_files(&self.deps, dir, pattern, self.config.depth).await?;
-
+        for (pattern, paths) in marker_map {
             for path in paths {
                 if let Some(parent_dir) = path.parent() {
-                    self.process_marker(parent_dir, pattern).await?;
+                    self.process_marker(parent_dir, &pattern).await?;
                 }
             }
         }
@@ -158,15 +157,7 @@ impl ProjectFinder {
 
     async fn process_marker(&self, dir: &Path, marker_name: &str) -> Result<()> {
         // Determine marker type
-        let marker_type = match marker_name {
-            "package.json" => MarkerType::PackageJson,
-            "Cargo.toml" => MarkerType::CargoToml,
-            "deno.json" | "deno.jsonc" => MarkerType::DenoJson,
-            "Makefile" | "CMakeLists.txt" | "justfile" | "Justfile" => {
-                MarkerType::BuildFile(marker_name.to_string())
-            }
-            _ => MarkerType::OtherConfig(marker_name.to_string()),
-        };
+        let marker_type = marker_name.parse().expect("How did we get here?");
 
         // Find project root
         let project_root = self.find_project_root(dir, &marker_type).await?;
@@ -176,7 +167,7 @@ impl ProjectFinder {
         // valid nested projects of different types)
         let mut should_add = true;
         {
-            let projects = self.discovered_projects.lock().await;
+            let projects = self.discovered_projects.read().await;
             for known_project in projects.iter() {
                 // Check if this is a direct parent (not just any ancestor)
                 let is_direct_parent = project_root
@@ -195,8 +186,7 @@ impl ProjectFinder {
         }
 
         if should_add {
-            let mut projects = self.discovered_projects.lock().await;
-            projects.insert(project_root);
+            self.discovered_projects.write().await.insert(project_root);
         }
 
         Ok(())
@@ -206,7 +196,7 @@ impl ProjectFinder {
         // Check cache
         let cache_key = (dir.to_path_buf(), format!("{marker_type:?}"));
         {
-            let cache = self.root_cache.lock().await;
+            let cache = self.root_cache.read().await;
             if let Some(root) = cache.get(&cache_key) {
                 return Ok(root.clone());
             }
@@ -246,8 +236,8 @@ impl ProjectFinder {
                     }
 
                     let cargo_toml = parent.join("Cargo.toml");
-                    if cargo_toml.exists()
-                        && grep_file(&self.deps, &cargo_toml, r"^\[workspace\]").await?
+                    if path_exists(&cargo_toml).await
+                        && grep_file_in_memory(&cargo_toml, r"^\[workspace\]").await?
                     {
                         result = parent.to_path_buf();
                         break;
@@ -309,7 +299,7 @@ impl ProjectFinder {
 
         // Cache the result
         self.root_cache
-            .lock()
+            .write()
             .await
             .insert(cache_key, result.clone());
 
@@ -319,7 +309,7 @@ impl ProjectFinder {
     async fn is_workspace_root(&self, dir: &Path) -> Result<bool> {
         // Check cache
         {
-            let cache = self.workspace_cache.lock().await;
+            let cache = self.workspace_cache.read().await;
             if let Some(&result) = cache.get(dir) {
                 return Ok(result);
             }
@@ -348,9 +338,9 @@ impl ProjectFinder {
 
         // Check for workspace by pattern matching
         for (file, pattern) in &workspace_patterns {
-            if file.exists() && grep_file(&self.deps, file, pattern).await? {
+            if path_exists(file).await && grep_file_in_memory(file, pattern).await? {
                 self.workspace_cache
-                    .lock()
+                    .write()
                     .await
                     .insert(dir.to_path_buf(), true);
                 return Ok(true);
@@ -359,9 +349,9 @@ impl ProjectFinder {
 
         // Check for workspace by file existence
         for file in &workspace_files {
-            if file.exists() {
+            if path_exists(file).await {
                 self.workspace_cache
-                    .lock()
+                    .write()
                     .await
                     .insert(dir.to_path_buf(), true);
                 return Ok(true);
@@ -370,7 +360,7 @@ impl ProjectFinder {
 
         // No workspace found
         self.workspace_cache
-            .lock()
+            .write()
             .await
             .insert(dir.to_path_buf(), false);
         Ok(false)

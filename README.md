@@ -23,8 +23,6 @@ To use Project Finder, you need the following dependencies installed on your sys
 
 * **fd:** A simple, fast, and user-friendly alternative to `find`.
   * Installation instructions: [https://github.com/sharkdp/fd#installation](https://github.com/sharkdp/fd#installation)
-* **ripgrep (rg):** A line-oriented search tool that recursively searches directories for a regex pattern.
-  * Installation instructions: [https://github.com/BurntSushi/ripgrep#installation](https://github.com/BurntSushi/ripgrep#installation)
 
 These tools must be available in your system's PATH.
 
