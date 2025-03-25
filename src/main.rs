@@ -7,12 +7,19 @@ mod marker;
 
 use crate::{config::Config, dependencies::Dependencies, finder::ProjectFinder};
 use clap::Parser;
-use std::process::exit;
-use tracing::{Level, error};
+use std::{error::Error, process::exit};
+use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
 #[tokio::main]
 async fn main() {
+    if let Err(e) = run().await {
+        eprintln!("{e}");
+        exit(1);
+    }
+}
+
+async fn run() -> Result<(), Box<dyn Error>> {
     // Parse CLI arguments
     let config = Config::parse();
 
@@ -24,33 +31,23 @@ async fn main() {
     };
     let subscriber = FmtSubscriber::builder().with_max_level(log_level).finish();
 
-    if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
-        eprintln!("Failed to set up logging: {e}");
-        exit(1);
-    }
+    tracing::subscriber::set_global_default(subscriber)
+        .map_err(|e| format!("Failed to set up logging: {e}"))?;
 
     // Check for required dependencies
-    let deps = match Dependencies::check() {
-        Ok(deps) => deps,
-        Err(e) => {
-            error!("{e}");
-            exit(1);
-        }
-    };
+    let deps = Dependencies::check().map_err(|e| format!("{e}"))?;
 
     // Create finder and search for projects
     let finder = ProjectFinder::new(config, deps);
 
-    match finder.find_projects().await {
-        Ok(projects) => {
-            for project in projects {
-                println!("{}", project.display());
-            }
-        }
-        Err(e) => {
-            error!("Failed to find projects: {e}");
-            eprintln!("Error: {e}");
-            exit(1);
-        }
+    let projects = finder
+        .find_projects()
+        .await
+        .map_err(|e| format!("Failed to find projects: {e}"))?;
+
+    for project in projects {
+        println!("{}", project.display());
     }
+
+    Ok(())
 }
