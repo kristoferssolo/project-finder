@@ -38,10 +38,12 @@ const MARKER_PATTERNS: [&str; 13] = [
     "bunfig.toml",
 ];
 
+/// Check whether a given path exists.
 async fn path_exists(path: &Path) -> bool {
     metadata(path).await.is_ok()
 }
 
+/// Struct responsible for scanning directories and detecting projects.
 #[derive(Debug, Clone)]
 pub struct ProjectFinder {
     config: Config,
@@ -52,6 +54,7 @@ pub struct ProjectFinder {
 }
 
 impl ProjectFinder {
+    /// Create a new `ProjectFinder` instance.
     pub fn new(config: Config, deps: Dependencies) -> Self {
         Self {
             config,
@@ -62,25 +65,24 @@ impl ProjectFinder {
         }
     }
 
+    /// Find projects in the configured paths.
     pub async fn find_projects(&self) -> Result<Vec<PathBuf>> {
         let semaphore = Arc::new(Semaphore::new(8)); // Limit to 8 concurrent tasks
-        let mut handles = vec![];
+        let mut handles = Vec::new();
 
         for path in &self.config.paths {
-            let path_buf = PathBuf::from(path);
-            if !path_buf.is_dir() {
-                return Err(ProjectFinderError::PathNotFound(path_buf));
+            if !path.is_dir() {
+                return Err(ProjectFinderError::PathNotFound(path.clone()));
             }
 
             if self.config.verbose {
-                info!("Searching in: {}", path);
+                info!("Searching in: {}", path.display());
             }
 
             let finder_clone = self.clone();
-            let path_clone = path_buf.clone();
+            let path_clone = path.clone();
             let semaphore_clone = Arc::clone(&semaphore);
 
-            // Spawn a task for each directory with semaphore permit
             let handle = spawn(async move {
                 let _permit = semaphore_clone.acquire().await.map_err(|e| {
                     ProjectFinderError::CommandExecutionFailed(format!(
@@ -92,6 +94,7 @@ impl ProjectFinder {
             handles.push(handle);
         }
 
+        // Await all tasks and collect errors.
         let handle_results = join_all(handles).await;
         let mut errors = handle_results
             .into_iter()
@@ -109,13 +112,12 @@ impl ProjectFinder {
             })
             .collect::<Vec<_>>();
 
-        // Return first error if any occurred
-        // Only fail if all tasks failed
+        // If all tasks failed, return one of the errors.
         if !errors.is_empty() && errors.len() == self.config.paths.len() {
             return Err(errors.remove(0));
         }
 
-        // Return sorted results
+        // Gather discovered projects, sort and apply max_results limit, if set.
         let mut projects = self
             .discovered_projects
             .read()
@@ -123,10 +125,7 @@ impl ProjectFinder {
             .iter()
             .cloned()
             .collect::<Vec<PathBuf>>();
-
         projects.sort();
-
-        // Apply max_results if set
         if self.config.max_results > 0 && projects.len() > self.config.max_results {
             projects.truncate(self.config.max_results);
         }
@@ -134,16 +133,18 @@ impl ProjectFinder {
         Ok(projects)
     }
 
+    /// Process a single directory by scanning for git repositories and marker files.
     async fn process_directory(&self, dir: &Path) -> Result<()> {
-        // First find all git repositories (usually the most reliable project indicators)
+        // Look for git repositories first.
         let git_repos = find_git_repos(&self.deps, dir, self.config.depth).await?;
 
         {
-            self.discovered_projects.write().await.extend(git_repos);
+            let mut projects = self.discovered_projects.write().await;
+            projects.extend(git_repos);
         }
 
+        // Look for marker files.
         let marker_map = find_files(&self.deps, dir, &MARKER_PATTERNS, self.config.depth).await?;
-
         for (pattern, paths) in marker_map {
             for path in paths {
                 if let Some(parent_dir) = path.parent() {
@@ -155,6 +156,7 @@ impl ProjectFinder {
         Ok(())
     }
 
+    /// Process a marker file found in a directory.
     async fn process_marker(&self, dir: &Path, marker_name: &str) -> Result<()> {
         // Determine marker type
         let marker_type = marker_name.parse().expect("How did we get here?");

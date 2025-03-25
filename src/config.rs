@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::path::PathBuf;
 
 #[derive(Debug, Parser, Clone)]
 #[clap(
@@ -9,7 +10,7 @@ use clap::Parser;
 pub struct Config {
     /// Directories to search for projects
     #[clap(default_value = ".")]
-    pub paths: Vec<String>,
+    pub paths: Vec<PathBuf>,
 
     /// Maximum search depth
     #[clap(short, long, default_value = "5")]

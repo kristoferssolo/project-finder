@@ -34,14 +34,6 @@ async fn main() {
         Ok(deps) => deps,
         Err(e) => {
             error!("{e}");
-            eprintln!("Error: {e}");
-            eprintln!(
-                "This tool requires both 'fd' and 'ripgrep' (rg) to be installed and available in your PATH."
-            );
-            eprintln!("Please install the missing dependencies and try again.");
-            eprintln!("\nInstallation instructions:");
-            eprintln!("  fd: https://github.com/sharkdp/fd#installation");
-            eprintln!("  ripgrep: https://github.com/BurntSushi/ripgrep#installation");
             exit(1);
         }
     };
@@ -51,7 +43,6 @@ async fn main() {
 
     match finder.find_projects().await {
         Ok(projects) => {
-            // Output results
             for project in projects {
                 println!("{}", project.display());
             }
