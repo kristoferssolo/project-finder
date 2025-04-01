@@ -46,4 +46,5 @@ expect_used = "warn"
 
 [[bench]]
 name = "benchmark"
+path = "benches/benchmark.rs"
 harness = false
