@@ -6,8 +6,9 @@ mod finder;
 mod marker;
 
 use crate::{config::Config, dependencies::Dependencies, finder::ProjectFinder};
+use anyhow::{Result, anyhow};
 use clap::Parser;
-use std::{error::Error, process::exit};
+use std::process::exit;
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
@@ -19,7 +20,7 @@ async fn main() {
     }
 }
 
-async fn run() -> Result<(), Box<dyn Error>> {
+async fn run() -> Result<()> {
     // Parse CLI arguments
     let config = Config::parse();
 
@@ -32,10 +33,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let subscriber = FmtSubscriber::builder().with_max_level(log_level).finish();
 
     tracing::subscriber::set_global_default(subscriber)
-        .map_err(|e| format!("Failed to set up logging: {e}"))?;
+        .map_err(|e| anyhow!("Failed to set up logging: {e}"))?;
 
     // Check for required dependencies
-    let deps = Dependencies::check().map_err(|e| format!("{e}"))?;
+    let deps = Dependencies::check().map_err(|e| anyhow!("{e}"))?;
 
     // Create finder and search for projects
     let finder = ProjectFinder::new(config, deps);
@@ -43,7 +44,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let projects = finder
         .find_projects()
         .await
-        .map_err(|e| format!("Failed to find projects: {e}"))?;
+        .map_err(|e| anyhow!("Failed to find projects: {e}"))?;
 
     for project in projects {
         println!("{}", project.display());
