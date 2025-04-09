@@ -1,7 +1,7 @@
 [package]
 name = "project-finder"
 authors = ["Kristofers Solo <dev@kristofers.xyz>"]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Fast project finder for developers"
 repository = "https://github.com/kristoferssolo/project-finder"
@@ -10,7 +10,16 @@ homepage = "https://github.com/kristoferssolo/project-finder"
 license = "MIT OR Apache-2.0"
 keywords = ["cli", "string", "text", "utility"]
 categories = ["command-line-utilities"]
-exclude = ["/.github", "/.gitignore", "/tests", "*.png", "*.md"]
+exclude = [
+  ".github/",
+  ".gitignore",
+  "tests/",
+  "benches/",
+  "scripts/",
+  "justifle",
+  "*.png",
+  "*.md",
+]
 readme = "README.md"
 
 [dependencies]
