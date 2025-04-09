@@ -2,6 +2,8 @@ use crate::errors::{ProjectFinderError, Result};
 use tracing::info;
 use which::which;
 
+const FD_PATH: [&str; 2] = ["fd", "fdfind"];
+
 /// Represents external dependencies required by the application.
 #[derive(Debug, Clone)]
 pub struct Dependencies {
@@ -27,15 +29,22 @@ impl Dependencies {
     pub fn check() -> Result<Self> {
         info!("Checking dependencies...");
 
-        let fd_path = which("fd")
-            .map(|path| path.to_string_lossy().into_owned())
-            .map_err(|_| {
+        let fd_path = FD_PATH
+            .iter()
+            .find_map(|binary| {
+                if let Ok(path) = which(binary) {
+                    let fd_path = path.to_string_lossy().into_owned();
+                    info!("Found {binary} at: {}", fd_path);
+                    return Some(fd_path);
+                }
+                None
+            })
+            .ok_or_else(|| {
                 ProjectFinderError::DependencyNotFound(
-                    "fd - install from https://github.com/sharkdp/fd".into(),
+                    "Neither 'fd' nor 'fdfind' was found. Please install fd from https://github.com/sharkdp/fd"
+                        .into(),
                 )
             })?;
-
-        info!("Found fd at: {fd_path}");
 
         Ok(Self::new(fd_path))
     }
