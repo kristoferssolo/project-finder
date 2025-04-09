@@ -54,10 +54,12 @@ pub fn run_binary_with_args(path: &Path, params: &BenchParams) -> anyhow::Result
     Ok(())
 }
 
-pub fn create_deep_directory(base: &Path, depth: usize) -> anyhow::Result<()> {
+#[allow(dead_code)]
+pub fn create_deep_directory(_base: &Path, _depth: usize) -> anyhow::Result<()> {
     todo!()
 }
 
-pub fn create_wide_directory(base: &Path, width: usize) -> anyhow::Result<()> {
+#[allow(dead_code)]
+pub fn create_wide_directory(_base: &Path, _width: usize) -> anyhow::Result<()> {
     todo!()
 }

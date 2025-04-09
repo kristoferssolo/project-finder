@@ -1,5 +1,3 @@
-use std::fmt::format;
-
 use crate::common::{
     default,
     setup::{BenchParams, TEMP_DIR, init_temp_dir},
