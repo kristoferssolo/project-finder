@@ -4,6 +4,7 @@ use csv::Reader;
 use regex::Regex;
 use serde::{Deserialize, Deserializer};
 use std::{
+    fmt::Display,
     fs::{self, File, create_dir_all},
     path::{Path, PathBuf},
     str::FromStr,
@@ -17,10 +18,10 @@ pub fn init_temp_dir() {
     TEMP_DIR.get_or_init(|| setup_entries().expect("Failed to setup test directory"));
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BenchParams {
-    pub depth: usize,
-    pub max_results: usize,
+    pub depth: Option<usize>,
+    pub max_results: Option<usize>,
     pub verbose: bool,
 }
 
@@ -185,4 +186,16 @@ fn create_file(path: &Path) -> anyhow::Result<()> {
 fn create_dir(path: &Path) -> anyhow::Result<()> {
     create_dir_all(path)?;
     Ok(())
+}
+
+impl Display for BenchParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "depth: {}, max: {}, verbose: {}",
+            self.depth.unwrap_or_default(),
+            self.max_results.unwrap_or_default(),
+            self.verbose
+        )
+    }
 }
